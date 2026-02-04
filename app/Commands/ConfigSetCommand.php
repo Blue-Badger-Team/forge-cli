@@ -12,7 +12,7 @@ class ConfigSetCommand extends Command
      * @var string
      */
     protected $signature = 'config:set
-        {name : Environment name (e.g., production, staging)}
+        {name? : Environment name (e.g., production, staging)}
         {server? : Server ID}
         {site? : Site ID}
         {--confirm : Require confirmation before deploying}
@@ -32,10 +32,16 @@ class ConfigSetCommand extends Command
      */
     public function handle()
     {
-        $name = strtolower($this->argument('name'));
+        $name = $this->argument('name');
         $serverId = $this->argument('server');
         $siteId = $this->argument('site');
 
+        // Interactive mode if no name provided
+        if (! $name) {
+            return $this->handleInteractive();
+        }
+
+        $name = strtolower($name);
         $config = $this->localConfig->all();
 
         // Determine if we're updating or creating
@@ -65,9 +71,84 @@ class ConfigSetCommand extends Command
         // Validate we have at least a server
         if (empty($envConfig['server']) && !$serverId) {
             $this->error('Server ID is required. Usage: forge config:set <name> <server-id> [site-id]');
+            $this->line('  Or run <comment>forge config:set</comment> without arguments for interactive mode.');
             return 1;
         }
 
+        return $this->saveEnvironment($name, $envConfig, $config, $isUpdate);
+    }
+
+    /**
+     * Handle interactive mode.
+     *
+     * @return int
+     */
+    protected function handleInteractive()
+    {
+        $this->step('Add/update environment');
+        $this->line('');
+
+        // Get environment name
+        $name = $this->askStep('Environment name (e.g., production, staging)');
+
+        if (empty($name)) {
+            $this->error('Environment name is required.');
+            return 1;
+        }
+
+        $name = strtolower(trim($name));
+        $config = $this->localConfig->all();
+
+        $isUpdate = isset($config['environments'][$name]);
+
+        if ($isUpdate) {
+            $this->warnStep(['Updating existing environment: %s', $name]);
+        }
+
+        $this->line('');
+
+        // Select server (interactive with lookup)
+        $serverId = $this->askForServer("Which server for '{$name}'");
+        $server = $this->forge->server($serverId);
+
+        // Get sites for selected server
+        $sites = collect($this->forge->sites($server->id));
+
+        $envConfig = [
+            'server' => $server->id,
+        ];
+
+        if ($sites->isNotEmpty()) {
+            $siteId = $this->choiceStep(
+                "Which site for '{$name}'",
+                $sites->mapWithKeys(fn ($site) => [$site->id => $site->name])->all()
+            );
+            $envConfig['site'] = $siteId;
+        } else {
+            $this->warnStep('No sites found on this server.');
+        }
+
+        // Ask about confirmation
+        $isProduction = in_array($name, ['production', 'prod', 'live', 'main', 'master']);
+
+        if ($this->confirmStep(["Require confirmation before deploying to %s?", $name], $isProduction)) {
+            $envConfig['confirm'] = true;
+        }
+
+        return $this->saveEnvironment($name, $envConfig, $config, $isUpdate);
+    }
+
+    /**
+     * Save the environment config.
+     *
+     * @param  string  $name
+     * @param  array  $envConfig
+     * @param  array  $config
+     * @param  bool  $isUpdate
+     * @return int
+     */
+    protected function saveEnvironment($name, $envConfig, $config, $isUpdate)
+    {
         // Build new config structure
         if (!isset($config['environments'])) {
             // Convert simple config to environment-based or create fresh
@@ -78,9 +159,8 @@ class ConfigSetCommand extends Command
                 ],
             ];
 
-            // If there was an existing simple config, preserve it as 'default' or migrate
+            // If there was an existing simple config, preserve it
             if (!empty($config['server'])) {
-                // Ask if they want to migrate existing config
                 $existingName = $this->askStep('Existing simple config found. Name for it?', 'legacy');
                 if ($existingName && $existingName !== $name) {
                     $newConfig['environments'][$existingName] = [
